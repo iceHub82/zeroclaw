@@ -435,12 +435,63 @@ struct NativeToolSpec {
 struct CacheControl {
     #[serde(rename = "type")]
     cache_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<String>,
+}
+
+/// Prompt-cache lifetime policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheTtlPolicy {
+    OneHour,
+    FiveMinutes,
+    Off,
+}
+
+/// `ZEROCLAW_CACHE_TTL` (read once):
+///   unset / "" / "1h"  -> 1-hour cache (default; Bedrock supports it for Claude 4.5+)
+///   "5m" / anything else -> Anthropic's original 5-minute cache
+///   "off" / "none" / "0" -> emit no cache markers at all
+fn cache_ttl_policy() -> CacheTtlPolicy {
+    use std::sync::OnceLock;
+    static POLICY: OnceLock<CacheTtlPolicy> = OnceLock::new();
+    let policy = POLICY.get_or_init(|| match std::env::var("ZEROCLAW_CACHE_TTL") {
+        Err(_) => CacheTtlPolicy::OneHour,
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "1h" | "1hr" | "60m" => CacheTtlPolicy::OneHour,
+            "off" | "none" | "disabled" | "0" => CacheTtlPolicy::Off,
+            _ => CacheTtlPolicy::FiveMinutes,
+        },
+    });
+    match policy {
+        CacheTtlPolicy::OneHour => CacheTtlPolicy::OneHour,
+        CacheTtlPolicy::FiveMinutes => CacheTtlPolicy::FiveMinutes,
+        CacheTtlPolicy::Off => CacheTtlPolicy::Off,
+    }
 }
 
 impl CacheControl {
     fn ephemeral() -> Self {
         Self {
             cache_type: "ephemeral".to_string(),
+            ttl: None,
+        }
+    }
+
+    /// Cache markers for a real request, honoring the operator TTL policy.
+    ///
+    /// Anthropic's default 5-minute cache can never be reused by a call cadence
+    /// coarser than 5 minutes, so those requests paid the 1.25x cache-write
+    /// premium and got nothing back. Bedrock supports a 1-hour TTL for Claude
+    /// 4.5+, which survives the ~30 minute cadence of the scheduled agents, so
+    /// that is the default.
+    fn for_request() -> Option<Self> {
+        match cache_ttl_policy() {
+            CacheTtlPolicy::Off => None,
+            CacheTtlPolicy::FiveMinutes => Some(Self::ephemeral()),
+            CacheTtlPolicy::OneHour => Some(Self {
+                cache_type: "ephemeral".to_string(),
+                ttl: Some("1h".to_string()),
+            }),
         }
     }
 }
@@ -617,7 +668,7 @@ impl AnthropicModelProvider {
         let prefix = SystemBlock {
             block_type: "text".to_string(),
             text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
-            cache_control: Some(CacheControl::ephemeral()),
+            cache_control: CacheControl::for_request(),
         };
         match system {
             Some(SystemPrompt::Blocks(mut blocks)) => {
@@ -629,7 +680,7 @@ impl AnthropicModelProvider {
                 SystemBlock {
                     block_type: "text".to_string(),
                     text: s,
-                    cache_control: Some(CacheControl::ephemeral()),
+                    cache_control: CacheControl::for_request(),
                 },
             ])),
             None => Some(SystemPrompt::Blocks(vec![prefix])),
@@ -649,7 +700,7 @@ impl AnthropicModelProvider {
             match last_content {
                 NativeContentOut::Text { cache_control, .. }
                 | NativeContentOut::ToolResult { cache_control, .. } => {
-                    *cache_control = Some(CacheControl::ephemeral());
+                    *cache_control = CacheControl::for_request();
                 }
                 NativeContentOut::ToolUse { .. }
                 | NativeContentOut::Image { .. }
@@ -680,7 +731,7 @@ impl AnthropicModelProvider {
 
         // Cache the last tool definition (caches all tools)
         if let Some(last_tool) = native_tools.last_mut() {
-            last_tool.cache_control = Some(CacheControl::ephemeral());
+            last_tool.cache_control = CacheControl::for_request();
         }
 
         Some(native_tools)
@@ -1403,7 +1454,7 @@ impl AnthropicModelProvider {
             SystemPrompt::Blocks(vec![SystemBlock {
                 block_type: "text".to_string(),
                 text,
-                cache_control: Some(CacheControl::ephemeral()),
+                cache_control: CacheControl::for_request(),
             }])
         });
 
